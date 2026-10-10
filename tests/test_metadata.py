@@ -346,3 +346,21 @@ def test_a_calendar_provider_that_raises_does_not_break_the_page(monkeypatch):
     monkeypatch.setitem(module.CALENDAR_PROVIDERS, "rawg", boom)
     got = module.calendar([{"type": "rawg", "api_key": "k"}])
     assert got["items"] == [] and got["error"]
+
+
+def test_catalog_search_keeps_igdb_relevance_order_without_sort(monkeypatch):
+    from romarr import metadata
+    queries = []
+
+    def query(cfg, endpoint, body, *, strict=False):
+        queries.append(body)
+        return [{"id": 1, "name": "Super Mario Bros.",
+                 "platforms": [{"id": 18, "name": "NES"}]}]
+
+    monkeypatch.setattr(metadata, "igdb_query", query)
+    rows, cursor = metadata.igdb_catalog_search({}, "Super Mario Bros.", 8, 0, [18])
+    assert rows[0]["title"] == "Super Mario Bros."
+    assert cursor is None
+    assert 'search "Super Mario Bros.";' in queries[0]
+    assert "sort " not in queries[0]
+    assert "platforms = (18)" in queries[0]

@@ -471,7 +471,7 @@ def igdb_catalog_search(cfg: dict, query: str, limit: int, offset: int,
     rows = igdb_query(
         cfg, "games",
         f'search "{escaped}"; {IGDB_CATALOG_FIELDS} where '
-        f'{" & ".join(where)}; sort name asc; limit 500; '
+        f'{" & ".join(where)}; limit 500; '
         f'offset {max(0, min(int(offset), 10000))};',
         strict=True,
     )
