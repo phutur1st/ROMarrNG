@@ -57,7 +57,8 @@ from .libraries import (
 from .clients import QBittorrent, QbitConfig, Romm, RommConfig
 from . import hub  # ROM Hub bridge -- the Cartridge plugin layer
 from .dat import DatIndex, parse_dat
-from .dat_catalog import dat_catalog_game, dat_catalog_page, dat_catalog_platforms
+from .dat_catalog import (DatCatalogCache, dat_catalog_game, dat_catalog_page,
+                          dat_catalog_platforms)
 from .decompress import run_batch as run_decompress_batch, scan_compressed
 from .titled import TitleDBIndex, build_index as build_titled_index, validate_switch_rom
 from .downloaders import (
@@ -317,7 +318,9 @@ def _seerr_library_lookup(service, titles: list[dict]) -> dict:
         return {"ready": bool(matches), "partial": bool(matches),
                 "matches": list(matches.values())}
     for game in games:
-        platform = resolve(game.platform)
+        if getattr(game, "origin", "local") == "cloud":
+            continue
+        platform = resolve(getattr(game, "platform_slug", "") or game.platform)
         if platform is None:
             continue
         key = (platform.slug, _seerr_title_key(game.name))
@@ -338,6 +341,8 @@ def _seerr_library_matches(service, request: SeerrRequest) -> list[dict]:
     wanted_title = _seerr_title_key(request.game)
     matches = []
     for row in rows:
+        if row.get("origin", "local") == "cloud":
+            continue
         if _seerr_title_key(row.get("name", "")) != wanted_title:
             continue
         platform = resolve(row.get("platform", ""))
@@ -763,6 +768,7 @@ class ROMarr:
         # waiting out its interval. Created before reload_libraries, which sets
         # it.
         self._refresh_now = threading.Event()
+        self._dat_catalog_cache = DatCatalogCache()
         self._started = time.monotonic()
 
         # History, Wanted and settings survive a restart. Without this a restart
@@ -2295,12 +2301,14 @@ class ROMarr:
         """
         import zipfile
 
-        self.dats = DatIndex()
+        loaded_dats = DatIndex()
         self.store.settings["dat_path"] = str(directory or "")
         if not directory:
+            self.dats = loaded_dats
             return {"loaded": 0, "path": ""}
         root = Path(directory)
         if not root.is_dir():
+            self.dats = loaded_dats
             log.warning("DAT_PATH %s is not a directory", root)
             return {"loaded": 0, "path": str(root),
                     "error": f"{root} is not a directory"}
@@ -2324,7 +2332,7 @@ class ROMarr:
                                     if parsed.games:
                                         if not parsed.name:
                                             parsed.name = Path(dat_name).stem[:160]
-                                        self.dats.add(parsed)
+                                        loaded_dats.add(parsed)
                                         loaded_count += 1
                     except (zipfile.BadZipFile, OSError) as zip_err:
                         log.warning("could not read zip %s: %s", path, zip_err)
@@ -2335,10 +2343,11 @@ class ROMarr:
                                                       errors="replace"))
                     if parsed.games and not parsed.name:
                         parsed.name = path.stem[:160]
-                    self.dats.add(parsed)
+                    loaded_dats.add(parsed)
                     loaded_count += 1
             except (OSError, ValueError) as exc:
                 log.warning("could not read %s: %s", path, exc)
+        self.dats = loaded_dats
         log.info("loaded %d DAT(s) from %s", len(self.dats.dats), root)
         result = {"loaded": len(self.dats.dats), "path": str(root),
                   "examined": len(found)}
@@ -2742,8 +2751,10 @@ class ROMarr:
                 "forced": forced,
             })
 
-        if imported and self.store.settings.get("rescan_after_import", True):
-            target_lib.rescan(platform.slug)
+        if imported:
+            if self.store.settings.get("rescan_after_import", True):
+                target_lib.rescan(platform.slug)
+            self._refresh_now.set()
         self.store.save()
 
         result = {
@@ -4867,6 +4878,7 @@ class ROMarr:
             if any_ok:
                 if self.store.settings.get("rescan_after_import", True):
                     target_lib.rescan(platform.slug)
+                self._refresh_now.set()
                 for w in list(self.store.wanted):
                     if request_ok and w.platform == platform.slug and w.game.lower() in name.lower():
                         self.store.fulfil(w.game, w.platform)
@@ -5283,11 +5295,13 @@ def make_handler(service: ROMarr):
                     regions = ["usa", "world", "europe", "japan"]
                 if route.path == "/api/v1/integration/catalog/dat/platforms":
                     return self._json(
-                        200, dat_catalog_platforms(service.dats.dats, regions)
+                        200, dat_catalog_platforms(service.dats.dats, regions,
+                            cache=getattr(service, "_dat_catalog_cache", None))
                     )
                 if route.path.startswith(dat_game_prefix):
                     key = unquote(route.path[len(dat_game_prefix):])
-                    game = dat_catalog_game(service.dats.dats, key, regions)
+                    game = dat_catalog_game(service.dats.dats, key, regions,
+                        cache=getattr(service, "_dat_catalog_cache", None))
                     return self._json(200, game) if game else self._json(
                         404, {"error": "DAT catalog title not found"}
                     )
@@ -5316,6 +5330,7 @@ def make_handler(service: ROMarr):
                             platform_slugs=platform_slugs,
                             query=term,
                             preferred_regions=regions,
+                            cache=getattr(service, "_dat_catalog_cache", None),
                         )
                         return self._json(200, {
                             "results": rows,
@@ -5330,6 +5345,7 @@ def make_handler(service: ROMarr):
                         offset=offset,
                         platform_slugs=platform_slugs,
                         preferred_regions=regions,
+                        cache=getattr(service, "_dat_catalog_cache", None),
                     )
                     return self._json(200, {
                         "results": rows,
@@ -6115,6 +6131,7 @@ def make_handler(service: ROMarr):
                         service.dats.dats,
                         catalog_key,
                         service.store.settings.get("preferred_regions"),
+                        cache=getattr(service, "_dat_catalog_cache", None),
                     )
                     if (selected is None
                             or selected["platformOptions"][0]["key"] != platform.slug

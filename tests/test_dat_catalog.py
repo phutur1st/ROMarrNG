@@ -78,3 +78,61 @@ def test_dat_catalog_rejects_bad_cursors_and_platform_slugs():
         dat_catalog_page([dat], offset=10001)
     with pytest.raises(ValueError):
         dat_catalog_page([dat], platform_slugs=["../library"])
+
+
+def test_catalog_cache_reuses_snapshot_and_cannot_be_mutated_by_responses(monkeypatch):
+    import romarr.dat_catalog as catalog
+    dat = parse_dat('<datafile><header><name>Game Boy</name></header>'
+                    '<game name="Tetris (USA)"/></datafile>')
+    cache = catalog.DatCatalogCache()
+    builds = []
+    original = catalog._selected_entries
+    def counted(*args):
+        builds.append(1)
+        return original(*args)
+    monkeypatch.setattr(catalog, "_selected_entries", counted)
+    rows, _ = dat_catalog_page([dat], cache=cache)
+    key = rows[0]["id"]
+    rows[0]["dat"]["entry"] = "corrupted response"
+    rows[0]["platformOptions"][0]["key"] = "wrong"
+    assert dat_catalog_game([dat], key, cache=cache)["dat"]["entry"] == "Tetris (USA)"
+    assert dat_catalog_platforms([dat], cache=cache)["results"][0]["gameCount"] == 1
+    assert dat_catalog_page([dat], query="tetris", cache=cache)[0][0]["id"] == key
+    assert len(builds) == 1
+
+
+def test_catalog_cache_changes_with_reload_and_region_preference():
+    from romarr.dat_catalog import DatCatalogCache
+    cache = DatCatalogCache()
+    xml = ('<datafile><header><name>Game Boy</name></header>'
+           '<game name="Tetris (USA)"/><game name="Tetris (Japan)"/>{}</datafile>')
+    dat = parse_dat(xml.format(""))
+    us, _ = dat_catalog_page([dat], preferred_regions=["usa", "japan"], cache=cache)
+    jp, _ = dat_catalog_page([dat], preferred_regions=["japan", "usa"], cache=cache)
+    assert us[0]["id"] == jp[0]["id"]
+    assert us[0]["dat"]["entry"] == "Tetris (USA)"
+    assert jp[0]["dat"]["entry"] == "Tetris (Japan)"
+    replacement = parse_dat(xml.format('<game name="Kirby (USA)"/>'))
+    rows, _ = dat_catalog_page([replacement], cache=cache)
+    assert [r["title"] for r in rows] == ["Kirby", "Tetris"]
+    assert dat_catalog_page([], cache=cache) == ([], None)
+
+
+def test_concurrent_catalog_requests_build_one_snapshot(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import romarr.dat_catalog as catalog
+    import time
+    dat = parse_dat('<datafile><header><name>Game Boy</name></header>'
+                    '<game name="Tetris (USA)"/></datafile>')
+    cache = catalog.DatCatalogCache()
+    builds = []
+    original = catalog._selected_entries
+    def slow(*args):
+        builds.append(1)
+        time.sleep(0.02)
+        return original(*args)
+    monkeypatch.setattr(catalog, "_selected_entries", slow)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        pages = list(pool.map(lambda _: dat_catalog_page([dat], cache=cache), range(8)))
+    assert all(page == pages[0] for page in pages)
+    assert len(builds) == 1

@@ -395,3 +395,26 @@ def test_request_view_reports_no_placement_when_nothing_is_imported(tmp_path, mo
     view = _seerr_request_view(service, SeerrRequest("seerr-none", "Game", "ps5"))
     assert view["rommPlacement"]["placed"] is False
     assert view["rommPlacement"]["library"] == "PS5 ROMs"
+
+
+def test_seerr_lookup_uses_canonical_platform_over_unknown_display_name(tmp_path):
+    from types import SimpleNamespace
+    service = ROMarr({"ROMARR_DATA": str(tmp_path / "state.json")})
+    service._library_cache = ([SimpleNamespace(name="Sonic the Hedgehog",
+        platform="My curated Sega collection", platform_slug="genesis")], 0, "")
+    service._library_partial = False
+    titles = [{"title": "Sonic the Hedgehog", "platform": "genesis-slash-megadrive"}]
+    assert _seerr_library_lookup(service, titles)["matches"] == titles
+
+
+def test_seerr_lookup_does_not_mark_missing_or_remote_catalog_rows_available(tmp_path):
+    from types import SimpleNamespace
+    service = ROMarr({"ROMARR_DATA": str(tmp_path / "state.json")})
+    game = SimpleNamespace(name="Sonic the Hedgehog", platform="Genesis",
+                           platform_slug="genesis", origin="cloud")
+    service._library_cache = ([game], 0, "")
+    service._library_partial = False
+    titles = [{"title": "Sonic the Hedgehog", "platform": "genesis-slash-megadrive"}]
+    assert _seerr_library_lookup(service, titles)["matches"] == []
+    game.origin = "local"
+    assert _seerr_library_lookup(service, titles)["matches"] == titles

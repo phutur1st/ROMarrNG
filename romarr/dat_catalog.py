@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass
 
@@ -158,11 +159,55 @@ def _selected_entries(
     return selected
 
 
+class DatCatalogCache:
+    """One catalog generation per service, shared by browse/search/detail.
+
+    Parsed DATs are read-only after loading. Reloading replaces their objects;
+    region changes also replace the snapshot. Retaining the source objects
+    prevents reused object IDs from returning a previous generation. The lock
+    makes simultaneous cold requests build once, and only one snapshot stays
+    resident regardless of the number of searches or preference changes.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sources: tuple[Dat, ...] = ()
+        self._regions: tuple[str, ...] | None = None
+        self._entries: tuple[DatCatalogEntry, ...] = ()
+        self._titles: tuple[str, ...] = ()
+        self._by_key: dict[str, DatCatalogEntry] = {}
+
+    def snapshot(self, dats, preferred_regions=None):
+        sources = tuple(dats)
+        regions = tuple(str(r).strip().lower() for r in
+                        (preferred_regions or ("usa", "world", "europe", "japan"))
+                        if str(r).strip()) or ("usa", "world", "europe", "japan")
+        with self._lock:
+            if (regions != self._regions or len(sources) != len(self._sources)
+                    or any(a is not b for a, b in zip(sources, self._sources))):
+                entries = tuple(_selected_entries(list(sources), regions))
+                titles = tuple(_normalise(entry.title) for entry in entries)
+                by_key = {entry.key: entry for entry in entries}
+                self._sources, self._regions = sources, regions
+                self._entries, self._titles, self._by_key = entries, titles, by_key
+            return self._entries, self._titles, self._by_key
+
+
+def _snapshot(dats, preferred_regions, cache):
+    if cache is not None:
+        return cache.snapshot(dats, preferred_regions)
+    entries = tuple(_selected_entries(dats, preferred_regions))
+    return entries, tuple(_normalise(e.title) for e in entries), {
+        entry.key: entry for entry in entries
+    }
+
+
 def dat_catalog_platforms(
     dats: list[Dat],
     preferred_regions: list[str] | tuple[str, ...] | None = None,
+    *, cache: DatCatalogCache | None = None,
 ) -> dict:
-    entries = _selected_entries(dats, preferred_regions)
+    entries, _, _ = _snapshot(dats, preferred_regions, cache)
     counts: dict[str, int] = {}
     for entry in entries:
         counts[entry.platform.slug] = counts.get(entry.platform.slug, 0) + 1
@@ -192,6 +237,7 @@ def dat_catalog_page(
     dats: list[Dat], *, limit: int = 24, offset: int = 0,
     platform_slugs: list[str] | None = None, query: str = "",
     preferred_regions: list[str] | tuple[str, ...] | None = None,
+    cache: DatCatalogCache | None = None,
 ) -> tuple[list[dict], int | None]:
     if not 1 <= int(limit) <= MAX_LIMIT:
         raise ValueError("invalid catalog limit")
@@ -205,13 +251,12 @@ def dat_catalog_page(
         raise ValueError("invalid DAT platform slugs")
 
     needle = _normalise(query)
-    rows = [
-        entry.as_dict()
-        for entry in _selected_entries(dats, preferred_regions)
-        if (not selected_slugs or entry.platform.slug in selected_slugs)
-        and (not needle or needle in _normalise(entry.title))
-    ]
-    page = rows[int(offset):int(offset) + int(limit)]
+    entries, titles, _ = _snapshot(dats, preferred_regions, cache)
+    rows = [entry for entry, title in zip(entries, titles)
+            if (not selected_slugs or entry.platform.slug in selected_slugs)
+            and (not needle or needle in title)]
+    page = [entry.as_dict() for entry in
+            rows[int(offset):int(offset) + int(limit)]]
     next_offset = int(offset) + len(page)
     return page, next_offset if next_offset < len(rows) else None
 
@@ -219,14 +264,10 @@ def dat_catalog_page(
 def dat_catalog_game(
     dats: list[Dat], key: str,
     preferred_regions: list[str] | tuple[str, ...] | None = None,
+    *, cache: DatCatalogCache | None = None,
 ) -> dict | None:
     if not isinstance(key, str) or not _VALID_KEY.fullmatch(key):
         return None
-    return next(
-        (
-            entry.as_dict()
-            for entry in _selected_entries(dats, preferred_regions)
-            if entry.key == key
-        ),
-        None,
-    )
+    _, _, by_key = _snapshot(dats, preferred_regions, cache)
+    entry = by_key.get(key)
+    return entry.as_dict() if entry is not None else None

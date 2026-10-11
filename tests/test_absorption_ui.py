@@ -99,7 +99,13 @@ def test_the_library_serves_organised_pages_not_the_first_100(tmp_path):
     assert len(beyond["items"]) == 15, "pagination reaches past any one page"
 
 
-def test_a_failing_list_records_why_on_the_list_itself(tmp_path):
+def test_a_failing_list_records_why_on_the_list_itself(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import requests
+    # An expired-token response is deterministic; a real Sony timeout tests
+    # network availability instead of the recorded authentication error.
+    monkeypatch.setattr(requests, "get", lambda *a, **k:
+                        SimpleNamespace(status_code=401, headers={}))
     from romarr.app import ROMarr
     svc = ROMarr(env={"ROMARR_DATA": str(tmp_path / "s.json")})
     svc.store.put_item("import_lists", {
